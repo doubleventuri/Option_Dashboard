@@ -1,0 +1,53 @@
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# Virtual environments
+env/
+venv/
+.venv/
+*.venv/
+
+# Environment and config files
+.env
+*.env
+.streamlit/secrets.toml
+.streamlit/config.toml
+
+# Operating system files
+.DS_Store
+Thumbs.db
+
+# Editor-specific files
+.vscode/
+.idea/
+
+# Data files (comment out if you want to keep specific ones)
+*.csv
+*.xlsx
+*.parquet
+*.pkl
+*.joblib
+
+# Log files
+*.log
+
+# Cache
+.cache/
+__pycache__/
+
+# Streamlit temporary files
+.streamlit/uploads/
+
+# Requirements lock (optional, include if using)
+poetry.lock
+Pipfile.lock
+
+# Spy dashboard screenshots or temp outputs
+*.png
+*.pdf
+
+
