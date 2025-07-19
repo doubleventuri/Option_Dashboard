@@ -39,6 +39,10 @@ from sklearn.calibration import CalibratedClassifierCV
 import mplfinance as mpf
 import warnings
 import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+
+
+
 
 warnings.filterwarnings('ignore')
 st.set_page_config(layout="wide")
@@ -64,20 +68,32 @@ return_threshold = st.sidebar.slider("Signal Threshold (log return)", 0.0005, 0.
 delta_assumption = st.sidebar.slider("Option Delta", 0.1, 1.0, 0.5, 0.05)
 contract_cost = st.sidebar.number_input("Contract Cost ($)", 1.0, 1000.0, 1.5, 0.1)
 confidence_threshold = st.sidebar.slider("Confidence Threshold", 0.0, 1.0, 0.5, 0.05)
+confidence_mode = st.sidebar.radio(
+    "Confidence Filter Mode",
+    ["Exact Threshold Only", "Include All Above Threshold"],
+    help="Controls whether to include only predictions near the threshold, or all stronger signals too.")
 hold_mode = st.sidebar.radio("Holding Strategy", ["Fixed Candles", "Until Signal Changes"])
 hold_period = st.sidebar.slider("Hold Period (candles)", 1, 6, 1, 1) if hold_mode == "Fixed Candles" else 1
 
 # === Indicator Config ===
 TECHNICAL_INDICATORS = [
     {
-        "name": "EMA (9, 21, 50)",
-        "key": "ema",
+        "name": "EMA 9",
+        "key": "ema9",
         "chart": True,
-        "function": lambda df: df.assign(
-            EMA_9=EMAIndicator(df['Close'], window=9).ema_indicator(),
-            EMA_21=EMAIndicator(df['Close'], window=21).ema_indicator(),
-            EMA_50=EMAIndicator(df['Close'], window=50).ema_indicator()
-        )
+        "function": lambda df: df.assign(EMA_9=EMAIndicator(df['Close'], window=9).ema_indicator())
+    },
+    {
+        "name": "EMA 21",
+        "key": "ema21",
+        "chart": True,
+        "function": lambda df: df.assign(EMA_21=EMAIndicator(df['Close'], window=21).ema_indicator())
+    },
+    {
+        "name": "EMA 50",
+        "key": "ema50",
+        "chart": True,
+        "function": lambda df: df.assign(EMA_50=EMAIndicator(df['Close'], window=50).ema_indicator())
     },
     {
         "name": "MACD",
@@ -99,15 +115,74 @@ TECHNICAL_INDICATORS = [
         "name": "VWAP",
         "key": "vwap",
         "chart": True,
-        "function": lambda df: df.assign(VWAP=VolumeWeightedAveragePrice(df['High'], df['Low'], df['Close'], df['Volume']).volume_weighted_average_price())
+        "function": lambda df: df.assign(
+            VWAP=VolumeWeightedAveragePrice(df['High'], df['Low'], df['Close'], df['Volume']).volume_weighted_average_price()
+        )
     },
     {
         "name": "ATR",
         "key": "atr",
         "chart": False,
-        "function": lambda df: df.assign(ATR=AverageTrueRange(df['High'], df['Low'], df['Close']).average_true_range())
+        "function": lambda df: df.assign(
+            ATR=AverageTrueRange(df['High'], df['Low'], df['Close']).average_true_range()
+        )
+    },
+    {
+        "name": "Stochastic Oscillator",
+        "key": "stoch",
+        "chart": True,
+        "function": lambda df: df.assign(
+            Stoch_K=((df['Close'] - df['Low'].rolling(14).min()) /
+                     (df['High'].rolling(14).max() - df['Low'].rolling(14).min()) * 100),
+            Stoch_D=lambda x: x['Stoch_K'].rolling(3).mean()
+        )
+    },
+    {
+        "name": "CCI (Commodity Channel Index)",
+        "key": "cci",
+        "chart": True,
+        "function": lambda df: df.assign(
+            CCI=(df['Close'] - (df['High'] + df['Low'] + df['Close']) / 3).rolling(20).apply(
+                lambda x: (x[-1] - x.mean()) / (0.015 * x.std()) if x.std() != 0 else 0, raw=False)
+        )
+    },
+    {
+        "name": "ADX (Average Directional Index)",
+        "key": "adx",
+        "chart": False,
+        "function": lambda df: df.assign(
+            ADX=AverageTrueRange(df['High'], df['Low'], df['Close']).average_true_range().rolling(14).mean()
+        )
+    },
+    {
+        "name": "Bollinger Band Width",
+        "key": "bbwidth",
+        "chart": True,
+        "function": lambda df: df.assign(
+            BB_MID=df['Close'].rolling(20).mean(),
+            BB_STD=df['Close'].rolling(20).std(),
+            BB_WIDTH=(df['Close'].rolling(20).std() * 4) / df['Close'].rolling(20).mean()
+        )
+    },
+    {
+        "name": "Momentum (Rate of Change)",
+        "key": "mom",
+        "chart": True,
+        "function": lambda df: df.assign(
+            MOM=df['Close'].pct_change(periods=5) * 100
+        )
+    },
+    {
+        "name": "Donchian Channel",
+        "key": "donchian",
+        "chart": True,
+        "function": lambda df: df.assign(
+            Donchian_Upper=df['High'].rolling(20).max(),
+            Donchian_Lower=df['Low'].rolling(20).min()
+        )
     }
 ]
+
 
 st.sidebar.header("📊 Technical Indicators")
 indicator_flags = {ind["key"]: st.sidebar.checkbox(ind["name"], value=True) for ind in TECHNICAL_INDICATORS}
@@ -170,36 +245,69 @@ def calculate_features(df):
         return None, None
 
 def backtest_trades(df, model, scaler, features, return_threshold, delta_assumption, contract_cost,
-                    hold_mode="Fixed Candles", hold_period=1, confidence_threshold=0.0):
+                    hold_mode="Fixed Candles", hold_period=1, confidence_threshold=0.0,
+                    confidence_mode="Include All Above Threshold"):
     trades = []
     df = df.copy()
     i = LOOKBACK_PERIOD
+
     while i < len(df) - 1:
         X_sample = df[features].iloc[i:i+1]
         X_scaled = scaler.transform(X_sample)
         proba = model.predict_proba(X_scaled)[0][1]
-        signal, direction, probability = None, 0, 0
-        if proba >= confidence_threshold:
-            signal, direction, probability = "CALL", 1, proba
-        elif (1 - proba) >= confidence_threshold:
-            signal, direction, probability = "PUT", -1, 1 - proba
-        else:
+
+        signal = None
+        direction = 0
+        probability = 0
+        match = False
+
+        # === Corrected logic ===
+        if confidence_mode.strip().lower() == "include all above threshold":
+            if proba >= confidence_threshold:
+                signal = "CALL"
+                direction = 1
+                probability = proba
+                match = True
+            elif (1 - proba) >= confidence_threshold:
+                signal = "PUT"
+                direction = -1
+                probability = 1 - proba
+                match = True
+        else:  # Exact Threshold Only (±0.01 band)
+            if abs(proba - confidence_threshold) < 0.01:
+                signal = "CALL" if proba > 0.5 else "PUT"
+                direction = 1 if signal == "CALL" else -1
+                probability = proba if signal == "CALL" else 1 - proba
+                match = True
+
+        if not match:
             i += 1
             continue
+
         entry_price = df['Close'].iloc[i]
-        exit_index = min(i + hold_period, len(df) - 1) if hold_mode == "Fixed Candles" else i + 1
-        while hold_mode != "Fixed Candles" and exit_index < len(df):
-            next_scaled = scaler.transform(df[features].iloc[exit_index:exit_index+1])
-            next_proba = model.predict_proba(next_scaled)[0][1]
-            if direction == 1 and next_proba < confidence_threshold:
+
+        if hold_mode == "Fixed Candles":
+            exit_index = min(i + hold_period, len(df) - 1)
+        else:
+            exit_index = i + 1
+            while exit_index < len(df):
+                X_next = df[features].iloc[exit_index:exit_index+1]
+                next_scaled = scaler.transform(X_next)
+                next_proba = model.predict_proba(next_scaled)[0][1]
+
+                if direction == 1 and next_proba < confidence_threshold:
+                    break
+                if direction == -1 and (1 - next_proba) < confidence_threshold:
+                    break
+
+                exit_index += 1
+
+            if exit_index >= len(df):
                 break
-            if direction == -1 and (1 - next_proba) < confidence_threshold:
-                break
-            exit_index += 1
-        if exit_index >= len(df):
-            break
+
         exit_price = df['Close'].iloc[exit_index]
         pnl = ((exit_price - entry_price) * direction * delta_assumption * 100) - contract_cost
+
         trades.append({
             "Time": df.index[i],
             "Signal": signal,
@@ -209,8 +317,11 @@ def backtest_trades(df, model, scaler, features, return_threshold, delta_assumpt
             "Hold Bars": exit_index - i,
             "P&L": pnl
         })
-        i = exit_index
+
+        i = exit_index  # move forward to avoid overlapping trades
+
     return pd.DataFrame(trades)
+
 
 # === Main Pipeline ===
 with st.status("Loading and processing data...", expanded=True) as status:
@@ -231,7 +342,7 @@ with st.spinner("Training model and running backtest..."):
     model.fit(X_scaled, y)
     bt_results = backtest_trades(processed_data, model, scaler, features,
                                  return_threshold, delta_assumption, contract_cost,
-                                 hold_mode, hold_period, confidence_threshold)
+                                 hold_mode, hold_period, confidence_threshold, confidence_mode)
 
 # === Prediction ===
 try:
@@ -291,32 +402,65 @@ else:
     st.line_chart(pd.DataFrame({"Equity Curve": equity, "SPY Price": price}))
 
 # === Chart ===
-st.subheader("📊 Technical Analysis")
-plot_data = processed_data[['Open', 'High', 'Low', 'Close', 'Volume']].iloc[-100:]
-apds = []
-for ind in TECHNICAL_INDICATORS:
-    if indicator_flags[ind["key"]] and ind["chart"]:
-        if ind["key"] == "ema":
-            for w in [9, 21, 50]:
-                apds.append(mpf.make_addplot(processed_data[f'EMA_{w}'].iloc[-100:], color='blue'))
-        elif ind["key"] == "macd":
-            apds.append(mpf.make_addplot(processed_data['MACD'].iloc[-100:], panel=1, color='green'))
-            apds.append(mpf.make_addplot(processed_data['MACD_Signal'].iloc[-100:], panel=1, color='orange'))
-        elif ind["key"] == "rsi":
-            apds.append(mpf.make_addplot(processed_data['RSI'].iloc[-100:], panel=2, color='black'))
-        elif ind["key"] == "vwap":
-            apds.append(mpf.make_addplot(processed_data['VWAP'].iloc[-100:], color='purple'))
+# === Price/Volume Section ===
+st.subheader("📊 Price/Volume (Zoomable)")
 
-processed_data['Signal_Marker'] = np.nan
-processed_data.loc[processed_data.index[-1], 'Signal_Marker'] = processed_data['Close'].iloc[-1]
-apds.append(mpf.make_addplot(processed_data['Signal_Marker'].iloc[-100:], type='scatter', markersize=120, marker='*', color='red'))
+# Use same winsorization on OHLC
+def winsorize_series(series, lower=0.01, upper=0.99):
+    q_low = series.quantile(lower)
+    q_high = series.quantile(upper)
+    return series.clip(lower=q_low, upper=q_high)
 
-try:
-    fig, _ = mpf.plot(plot_data, type='candle', addplot=apds, volume=True,
-                      panel_ratios=(4, 1, 1), style='yahoo', returnfig=True)
-    st.pyplot(fig)
-except Exception as e:
-    st.error(f"Chart rendering failed: {str(e)}")
+# Slice and clean last 100 rows
+last_100 = processed_data.iloc[-100:].copy()
+for col in ['Open', 'High', 'Low', 'Close']:
+    last_100[col] = winsorize_series(last_100[col])
+
+# Create candlestick + volume chart
+fig = go.Figure()
+
+# Candlestick
+fig.add_trace(go.Candlestick(
+    x=last_100.index,
+    open=last_100['Open'],
+    high=last_100['High'],
+    low=last_100['Low'],
+    close=last_100['Close'],
+    name='Price'
+))
+
+# Volume as bar trace
+fig.add_trace(go.Bar(
+    x=last_100.index,
+    y=last_100['Volume'],
+    name='Volume',
+    marker_color='lightgray',
+    yaxis='y2',
+    opacity=0.4
+))
+
+# Add large red star for signal marker
+fig.add_trace(go.Scatter(
+    x=[last_100.index[-1]],
+    y=[last_100['Close'].iloc[-1]],
+    mode='markers',
+    marker=dict(symbol='star', size=16, color='red'),
+    name='Signal'
+))
+
+# Layout: dual y-axes
+fig.update_layout(
+    title='Price & Volume (Zoom Enabled)',
+    xaxis=dict(type='category'),
+    yaxis=dict(title='Price'),
+    yaxis2=dict(title='Volume', overlaying='y', side='right', showgrid=False),
+    xaxis_rangeslider_visible=False,
+    hovermode='x unified',
+    height=600,
+    margin=dict(t=40, b=40)
+)
+
+st.plotly_chart(fig, use_container_width=True)
 
 
 
