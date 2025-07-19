@@ -35,71 +35,92 @@ from ta.volume import VolumeWeightedAveragePrice
 from ta.volatility import AverageTrueRange
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
+from sklearn.calibration import CalibratedClassifierCV
 import mplfinance as mpf
 import warnings
 import matplotlib.pyplot as plt
 
-# Configuration
 warnings.filterwarnings('ignore')
 st.set_page_config(layout="wide")
 
-# Constants
+# === Constants ===
 MIN_DATA_POINTS = 30
 LOOKBACK_PERIOD = 5
-DATA_RETRIEVAL_DAYS = 10
 REQUIRED_COLS = ['Open', 'High', 'Low', 'Close', 'Volume']
 
 st_autorefresh(interval=300000, key="data_refresh")
 st.title("📈 SPY Options Forecast Dashboard")
 
-# Sidebar controls
+# === Sidebar ===
+st.sidebar.header("🕒 Data Settings")
+interval = st.sidebar.selectbox("Interval", ["1m", "5m", "15m", "30m", "60m", "90m", "1d"], index=2)
+period = st.sidebar.selectbox("History Length", ["1d", "2d", "5d", "10d", "1mo", "3mo"], index=3)
+
+if interval == "1m" and period not in ["1d", "2d", "5d", "7d"]:
+    st.warning("⚠️ Yahoo Finance only supports up to 7 days for 1-minute interval.")
+
 st.sidebar.header("🎛️ Strategy Tuner")
-
-return_threshold = st.sidebar.slider(
-    "Signal Threshold (log return)", 
-    0.0005, 0.01, 0.0015, 0.0005,
-    help="Minimum predicted log return required to consider a trade. Higher values filter out low-confidence, small-move trades.")
-
-delta_assumption = st.sidebar.slider(
-    "Option Delta", 
-    0.1, 1.0, 0.5, 0.05,
-    help="Delta represents sensitivity to the underlying price. Lower delta means cheaper contracts but more out-of-the-money risk.")
-
+return_threshold = st.sidebar.slider("Signal Threshold (log return)", 0.0005, 0.01, 0.0015, 0.0005)
+delta_assumption = st.sidebar.slider("Option Delta", 0.1, 1.0, 0.5, 0.05)
 contract_cost = st.sidebar.number_input("Contract Cost ($)", 1.0, 1000.0, 1.5, 0.1)
+confidence_threshold = st.sidebar.slider("Confidence Threshold", 0.0, 1.0, 0.5, 0.05)
+hold_mode = st.sidebar.radio("Holding Strategy", ["Fixed Candles", "Until Signal Changes"])
+hold_period = st.sidebar.slider("Hold Period (candles)", 1, 6, 1, 1) if hold_mode == "Fixed Candles" else 1
 
-confidence_threshold = st.sidebar.slider(
-    "Confidence Threshold", 0.0, 1.0, 0.5, 0.05)
+# === Indicator Config ===
+TECHNICAL_INDICATORS = [
+    {
+        "name": "EMA (9, 21, 50)",
+        "key": "ema",
+        "chart": True,
+        "function": lambda df: df.assign(
+            EMA_9=EMAIndicator(df['Close'], window=9).ema_indicator(),
+            EMA_21=EMAIndicator(df['Close'], window=21).ema_indicator(),
+            EMA_50=EMAIndicator(df['Close'], window=50).ema_indicator()
+        )
+    },
+    {
+        "name": "MACD",
+        "key": "macd",
+        "chart": True,
+        "function": lambda df: df.assign(
+            MACD=MACD(df['Close']).macd(),
+            MACD_Signal=MACD(df['Close']).macd_signal(),
+            MACD_Hist=MACD(df['Close']).macd_diff()
+        )
+    },
+    {
+        "name": "RSI",
+        "key": "rsi",
+        "chart": True,
+        "function": lambda df: df.assign(RSI=RSIIndicator(df['Close']).rsi())
+    },
+    {
+        "name": "VWAP",
+        "key": "vwap",
+        "chart": True,
+        "function": lambda df: df.assign(VWAP=VolumeWeightedAveragePrice(df['High'], df['Low'], df['Close'], df['Volume']).volume_weighted_average_price())
+    },
+    {
+        "name": "ATR",
+        "key": "atr",
+        "chart": False,
+        "function": lambda df: df.assign(ATR=AverageTrueRange(df['High'], df['Low'], df['Close']).average_true_range())
+    }
+]
 
-hold_mode = st.sidebar.radio(
-    "Holding Strategy",
-    ["Fixed Candles", "Until Signal Changes"],
-    help="Choose whether to exit after a fixed number of bars or wait until the model gives a different signal.")
+st.sidebar.header("📊 Technical Indicators")
+indicator_flags = {ind["key"]: st.sidebar.checkbox(ind["name"], value=True) for ind in TECHNICAL_INDICATORS}
 
-if hold_mode == "Fixed Candles":
-    hold_period = st.sidebar.slider("Hold Period (candles)", 1, 6, 1, 1)
-else:
-    hold_period = 1  # Placeholder — actual hold duration handled in backtest logic
-
-
-col1, col2 = st.columns(2)
-with col1:
-    show_ema = st.checkbox("Show EMA (9, 21, 50)", value=True)
-    show_macd = st.checkbox("Show MACD", value=True)
-with col2:
-    show_rsi = st.checkbox("Show RSI", value=True)
-    show_vwap = st.checkbox("Show VWAP", value=True)
-
-def safe_download_data():
+# === Data Functions ===
+def safe_download_data(interval, period):
     try:
         with st.spinner("Downloading market data..."):
-            df = yf.download("SPY", interval="15m", period=f"{DATA_RETRIEVAL_DAYS}d", prepost=True, progress=False)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = [col[0] if isinstance(col, tuple) else col for col in df.columns]
-            if not isinstance(df, pd.DataFrame) or df.empty:
-                st.warning("Initial download failed, trying fallback...")
-                df = yf.Ticker("SPY").history(period=f"{DATA_RETRIEVAL_DAYS}d", interval="15m")
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = [col[0] if isinstance(col, tuple) else col for col in df.columns]
+            df = yf.download("SPY", interval=interval, period=period, prepost=True, progress=False)
+            df.columns = df.columns.get_level_values(0) if isinstance(df.columns, pd.MultiIndex) else df.columns
+            if df.empty:
+                df = yf.Ticker("SPY").history(interval=interval, period=period)
+                df.columns = df.columns.get_level_values(0) if isinstance(df.columns, pd.MultiIndex) else df.columns
             return df
     except Exception as e:
         st.error(f"Data download failed: {str(e)}")
@@ -117,90 +138,68 @@ def validate_and_clean_data(df):
     for col in REQUIRED_COLS:
         df[col] = pd.to_numeric(df[col], errors='coerce')
     df = df[df[['Open', 'High', 'Low', 'Close']].notna().all(axis=1)]
+    df['Volume'] = df['Volume'].fillna(0)
     if len(df) < MIN_DATA_POINTS:
         st.warning("Not enough valid OHLC data")
         return None
-    df['Volume'] = df['Volume'].fillna(0)
     return df
 
 def calculate_features(df):
     try:
         df = df.copy()
-        close = df['Close']
-        high = df['High']
-        low = df['Low']
-        volume = df['Volume']
-        for w in [9, 21, 50]:
-            df[f'EMA_{w}'] = EMAIndicator(close=close, window=w).ema_indicator()
-        df['RSI'] = RSIIndicator(close=close).rsi()
-        df['VWAP'] = VolumeWeightedAveragePrice(high, low, close, volume).volume_weighted_average_price()
-        macd = MACD(close)
-        df['MACD'] = macd.macd()
-        df['MACD_Signal'] = macd.macd_signal()
-        df['MACD_Hist'] = macd.macd_diff()
-        df['ATR'] = AverageTrueRange(high, low, close).average_true_range()
-        df['Log_Return'] = np.log(close / close.shift(1))
+        df['Log_Return'] = np.log(df['Close'] / df['Close'].shift(1))
         for i in range(1, LOOKBACK_PERIOD + 1):
             df[f'Return_lag_{i}'] = df['Log_Return'].shift(i)
+        for ind in TECHNICAL_INDICATORS:
+            if indicator_flags[ind["key"]]:
+                df = ind["function"](df)
         df['Target'] = (df['Log_Return'].shift(-1) > return_threshold).astype(int)
-        features = ['Log_Return'] + [f'Return_lag_{i}' for i in range(1, LOOKBACK_PERIOD + 1)] + ['Target']
-        df = df.dropna(subset=features)
+        feature_cols = [col for col in df.columns if col.startswith("Return_lag_") or col == "Log_Return"]
+        for ind in TECHNICAL_INDICATORS:
+            if indicator_flags[ind["key"]]:
+                for col in df.columns:
+                    if ind["key"].upper() in col or col.startswith(ind["key"].upper()):
+                        feature_cols.append(col)
+        df = df.dropna(subset=feature_cols + ['Target'])
         if len(df) < MIN_DATA_POINTS:
             st.warning("Too few samples after feature calculation")
-            return None
-        return df
+            return None, None
+        return df, feature_cols
     except Exception as e:
         st.error(f"Feature calculation failed: {str(e)}")
-        return None
+        return None, None
 
 def backtest_trades(df, model, scaler, features, return_threshold, delta_assumption, contract_cost,
                     hold_mode="Fixed Candles", hold_period=1, confidence_threshold=0.0):
     trades = []
     df = df.copy()
     i = LOOKBACK_PERIOD
-
     while i < len(df) - 1:
         X_sample = df[features].iloc[i:i+1]
         X_scaled = scaler.transform(X_sample)
         proba = model.predict_proba(X_scaled)[0][1]
-
-        signal = None
+        signal, direction, probability = None, 0, 0
         if proba >= confidence_threshold:
-            signal = "CALL"
-            direction = 1
-            probability = proba
+            signal, direction, probability = "CALL", 1, proba
         elif (1 - proba) >= confidence_threshold:
-            signal = "PUT"
-            direction = -1
-            probability = 1 - proba
+            signal, direction, probability = "PUT", -1, 1 - proba
         else:
             i += 1
             continue
-
         entry_price = df['Close'].iloc[i]
-
-        if hold_mode == "Fixed Candles":
-            exit_index = min(i + hold_period, len(df) - 1)
-        else:
-            exit_index = i + 1
-            while exit_index < len(df):
-                X_next = df[features].iloc[exit_index:exit_index+1]
-                next_scaled = scaler.transform(X_next)
-                next_proba = model.predict_proba(next_scaled)[0][1]
-
-                if direction == 1 and next_proba < confidence_threshold:
-                    break
-                if direction == -1 and (1 - next_proba) < confidence_threshold:
-                    break
-
-                exit_index += 1
-
-            if exit_index >= len(df):
+        exit_index = min(i + hold_period, len(df) - 1) if hold_mode == "Fixed Candles" else i + 1
+        while hold_mode != "Fixed Candles" and exit_index < len(df):
+            next_scaled = scaler.transform(df[features].iloc[exit_index:exit_index+1])
+            next_proba = model.predict_proba(next_scaled)[0][1]
+            if direction == 1 and next_proba < confidence_threshold:
                 break
-
+            if direction == -1 and (1 - next_proba) < confidence_threshold:
+                break
+            exit_index += 1
+        if exit_index >= len(df):
+            break
         exit_price = df['Close'].iloc[exit_index]
         pnl = ((exit_price - entry_price) * direction * delta_assumption * 100) - contract_cost
-
         trades.append({
             "Time": df.index[i],
             "Signal": signal,
@@ -210,59 +209,42 @@ def backtest_trades(df, model, scaler, features, return_threshold, delta_assumpt
             "Hold Bars": exit_index - i,
             "P&L": pnl
         })
-
-        i = exit_index  # move forward to avoid overlapping trades
-
+        i = exit_index
     return pd.DataFrame(trades)
 
-
-# === Pipeline ===
+# === Main Pipeline ===
 with st.status("Loading and processing data...", expanded=True) as status:
-    raw_data = safe_download_data()
+    raw_data = safe_download_data(interval, period)
     cleaned_data = validate_and_clean_data(raw_data)
-    processed_data = calculate_features(cleaned_data)
+    processed_data, features = calculate_features(cleaned_data)
     status.update(label="Data processing complete!", state="complete")
 
-if processed_data is None:
+if processed_data is None or features is None:
     st.stop()
 
-features = [f'Return_lag_{i}' for i in range(1, LOOKBACK_PERIOD + 1)]
-X = processed_data[features]
-y = processed_data['Target']
-
+X, y = processed_data[features], processed_data['Target']
 with st.spinner("Training model and running backtest..."):
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
-    model = RandomForestClassifier(n_estimators=100, random_state=42, min_samples_leaf=5, class_weight='balanced')
+    base_model = RandomForestClassifier(n_estimators=100, random_state=42, min_samples_leaf=5, class_weight='balanced')
+    model = CalibratedClassifierCV(base_model, method='sigmoid', cv=5)
     model.fit(X_scaled, y)
-    bt_results = backtest_trades(
-    processed_data,
-    model,
-    scaler,
-    features,
-    return_threshold,
-    delta_assumption,
-    contract_cost,
-    hold_mode=hold_mode,
-    hold_period=hold_period if hold_mode == "Fixed Candles" else 1,
-    confidence_threshold=confidence_threshold)
+    bt_results = backtest_trades(processed_data, model, scaler, features,
+                                 return_threshold, delta_assumption, contract_cost,
+                                 hold_mode, hold_period, confidence_threshold)
 
-
-# === Latest Prediction ===
+# === Prediction ===
 try:
     latest_scaled = scaler.transform(processed_data[features].iloc[-1:].values)
     proba = model.predict_proba(latest_scaled)[0][1]
     expected_return_call = proba * delta_assumption * 100 - contract_cost
     expected_return_put = (1 - proba) * delta_assumption * 100 - contract_cost
     if expected_return_call > 0 and expected_return_call >= expected_return_put:
-        signal = '📈 CALL'
-        expected_return = expected_return_call
+        signal, expected_return = '📈 CALL', expected_return_call
     elif expected_return_put > 0:
-        signal = '📉 PUT'
-        expected_return = expected_return_put
+        signal, expected_return = '📉 PUT', expected_return_put
     else:
-        signal = '🚫 NO TRADE'
-        expected_return = 0
+        signal, expected_return = '🚫 NO TRADE', 0
 except Exception as e:
     st.error(f"Prediction failed: {str(e)}")
     st.stop()
@@ -273,32 +255,20 @@ col1.metric("Signal", signal)
 col2.metric("Confidence", f"{proba*100:.1f}%")
 col3.metric("Expected Return", f"${expected_return:.2f}")
 
-# === Backtest Results ===
+# === Backtest Display ===
 st.subheader("💰 Backtest Results")
 if bt_results.empty:
     st.write("No trades met the threshold.")
 else:
-    # Format timestamp for Excel and create download
     export_df = bt_results.copy()
     export_df['Time'] = export_df['Time'].dt.strftime('%Y-%m-%d %H:%M:%S')
-
-    csv_data = export_df.to_csv(index=False).encode('utf-8')
-    st.download_button(
-        label="📥 Download Full Backtest CSV",
-        data=csv_data,
-        file_name="backtest_results.csv",
-        mime='text/csv'
-    )
+    st.download_button("📥 Download Full Backtest CSV", data=export_df.to_csv(index=False).encode('utf-8'),
+                       file_name="backtest_results.csv", mime='text/csv')
     st.dataframe(bt_results.tail(10), use_container_width=True)
-    total_pnl = bt_results["P&L"].sum()
-    win_rate = (bt_results["P&L"] > 0).mean() * 100
-    st.metric("Total P&L", f"${total_pnl:.2f}")
-    st.metric("Win Rate", f"{win_rate:.1f}%")
+    st.metric("Total P&L", f"${bt_results['P&L'].sum():.2f}")
+    st.metric("Win Rate", f"{(bt_results['P&L'] > 0).mean()*100:.1f}%")
     st.metric("Trades", f"{len(bt_results)}")
-    
     st.line_chart(bt_results["P&L"].cumsum(), use_container_width=True)
-
-    # Confidence bucket breakdown
     bt_results['Confidence_Bucket'] = (bt_results['Probability'] * 10).astype(int) / 10.0
     bucket_stats = bt_results.groupby('Confidence_Bucket').agg(
         Trades=('P&L', 'count'),
@@ -308,7 +278,6 @@ else:
     ).reset_index()
     st.subheader("📊 Performance by Confidence Bucket")
     st.dataframe(bucket_stats)
-
     fig, ax = plt.subplots()
     ax.bar(bucket_stats['Confidence_Bucket'], bucket_stats['WinRate'], width=0.05)
     ax.set_xlabel('Confidence Bucket')
@@ -316,10 +285,6 @@ else:
     ax.set_title('Win Rate by Confidence')
     ax.set_ylim(0, 100)
     st.pyplot(fig)
-
-    
-
-    # Equity vs SPY
     equity = bt_results["P&L"].cumsum()
     equity.index = bt_results["Time"]
     price = processed_data["Close"].loc[equity.index.min():equity.index.max()]
@@ -329,30 +294,26 @@ else:
 st.subheader("📊 Technical Analysis")
 plot_data = processed_data[['Open', 'High', 'Low', 'Close', 'Volume']].iloc[-100:]
 apds = []
-if show_ema:
-    for w in [9, 21, 50]:
-        apds.append(mpf.make_addplot(processed_data[f'EMA_{w}'].iloc[-100:], color='blue', width=0.8))
-if show_vwap:
-    apds.append(mpf.make_addplot(processed_data['VWAP'].iloc[-100:], color='purple', width=0.8))
-if show_macd:
-    apds.append(mpf.make_addplot(processed_data['MACD'].iloc[-100:], panel=1, color='green'))
-    apds.append(mpf.make_addplot(processed_data['MACD_Signal'].iloc[-100:], panel=1, color='orange'))
-if show_rsi:
-    apds.append(mpf.make_addplot(processed_data['RSI'].iloc[-100:], panel=2, color='black'))
+for ind in TECHNICAL_INDICATORS:
+    if indicator_flags[ind["key"]] and ind["chart"]:
+        if ind["key"] == "ema":
+            for w in [9, 21, 50]:
+                apds.append(mpf.make_addplot(processed_data[f'EMA_{w}'].iloc[-100:], color='blue'))
+        elif ind["key"] == "macd":
+            apds.append(mpf.make_addplot(processed_data['MACD'].iloc[-100:], panel=1, color='green'))
+            apds.append(mpf.make_addplot(processed_data['MACD_Signal'].iloc[-100:], panel=1, color='orange'))
+        elif ind["key"] == "rsi":
+            apds.append(mpf.make_addplot(processed_data['RSI'].iloc[-100:], panel=2, color='black'))
+        elif ind["key"] == "vwap":
+            apds.append(mpf.make_addplot(processed_data['VWAP'].iloc[-100:], color='purple'))
+
 processed_data['Signal_Marker'] = np.nan
 processed_data.loc[processed_data.index[-1], 'Signal_Marker'] = processed_data['Close'].iloc[-1]
 apds.append(mpf.make_addplot(processed_data['Signal_Marker'].iloc[-100:], type='scatter', markersize=120, marker='*', color='red'))
 
 try:
-    fig, _ = mpf.plot(
-        plot_data,
-        type='candle',
-        addplot=apds,
-        volume=True,
-        panel_ratios=(4, 1, 1),
-        style='yahoo',
-        returnfig=True
-    )
+    fig, _ = mpf.plot(plot_data, type='candle', addplot=apds, volume=True,
+                      panel_ratios=(4, 1, 1), style='yahoo', returnfig=True)
     st.pyplot(fig)
 except Exception as e:
     st.error(f"Chart rendering failed: {str(e)}")
