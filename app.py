@@ -1,7 +1,7 @@
 # =============================================================================
 # SPY Options Forecast Dashboard
 # -----------------------------------------------------------------------------
-# Author: Chris S.
+# Author: Chris Schallberger
 # Created: July 2025
 # Description:
 #   This Streamlit dashboard forecasts intraday SPY price movement using a 
