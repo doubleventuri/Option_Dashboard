@@ -1,3 +1,29 @@
+# =============================================================================
+# SPY Options Forecast Dashboard
+# -----------------------------------------------------------------------------
+# Author: Chris S.
+# Created: July 2025
+# Description:
+#   This Streamlit dashboard forecasts intraday SPY price movement using a 
+#   machine learning model (RandomForestClassifier). It provides signals for 
+#   CALL or PUT options based on log return thresholds and confidence levels.
+#   The app includes backtesting with options-style P&L calculations, 
+#   adjustable strategy parameters, technical analysis overlays, and 
+#   visual performance tracking.
+#
+#   Features:
+#     - Real-time 15-minute interval SPY data from Yahoo Finance
+#     - Technical indicators: EMA, VWAP, RSI, MACD, ATR
+#     - Strategy tuner for delta, return threshold, contract cost
+#     - Confidence-filtered signal prediction
+#     - Option to hold trades for fixed candles or until signal changes
+#     - Backtesting with P&L tracking, equity curve, and confidence buckets
+#     - Downloadable trade history with Excel-compatible timestamps
+#
+# License: All rights reserved. See LICENSE file for terms of use.
+# =============================================================================
+
+
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 import numpy as np
