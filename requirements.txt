@@ -1,12 +1,15 @@
 streamlit>=1.32.0
-streamlit-autorefresh>=1.0.1
-pandas>=1.5.0
-numpy>=1.21.0
-yfinance>=0.2.18
-scikit-learn>=1.1.0
+streamlit-autorefresh>=0.0.4
+numpy>=1.24.0
+pandas>=1.5.3
+yfinance>=0.2.30
 ta>=0.10.2
+scikit-learn>=1.2.0
 mplfinance>=0.12.9b7
-matplotlib>=3.5.0
-plotly==5.21.0
+matplotlib>=3.7.0
+plotly>=5.18.0
+tzlocal>=5.0.1
+pytz>=2023.3
+
 
 
